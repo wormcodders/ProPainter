@@ -4,12 +4,17 @@ import cv2
 import argparse
 import imageio
 import numpy as np
-import scipy.ndimage
 from PIL import Image
 from tqdm import tqdm
 
 import torch
 import torchvision
+
+# Workarounds for Blackwell (RTX 50-series) CUBLAS compatibility
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 from model.modules.flow_comp_raft import RAFT_bi
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
@@ -49,10 +54,17 @@ def resize_frames(frames, size=None):
 def read_frame_from_videos(frame_root):
     if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
         video_name = os.path.basename(frame_root)[:-4]
-        vframes, aframes, info = torchvision.io.read_video(filename=frame_root, pts_unit='sec') # RGB
-        frames = list(vframes.numpy())
-        frames = [Image.fromarray(f) for f in frames]
-        fps = info['video_fps']
+        import cv2
+        cap = cv2.VideoCapture(frame_root)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(frame))
+        cap.release()
     else:
         video_name = os.path.basename(frame_root)
         frames = []
@@ -93,7 +105,7 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
 
         # Dilate 8 pixel so that all known pixel is trustworthy
         if flow_mask_dilates > 0:
-            flow_mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=flow_mask_dilates).astype(np.uint8)
+            flow_mask_img = cv2.dilate(mask_img, np.ones((3, 3), np.uint8), iterations=flow_mask_dilates)
         else:
             flow_mask_img = binary_mask(mask_img).astype(np.uint8)
         # Close the small holes inside the foreground objects
@@ -102,7 +114,7 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
         flow_masks.append(Image.fromarray(flow_mask_img * 255))
         
         if mask_dilates > 0:
-            mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=mask_dilates).astype(np.uint8)
+            mask_img = cv2.dilate(mask_img, np.ones((3, 3), np.uint8), iterations=mask_dilates)
         else:
             mask_img = binary_mask(mask_img).astype(np.uint8)
         masks_dilated.append(Image.fromarray(mask_img * 255))
@@ -177,6 +189,7 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 if __name__ == '__main__':
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = get_device()
+    print(f"PROPAINTER_DEVICE: {device}", flush=True)
     
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -221,6 +234,7 @@ if __name__ == '__main__':
     if device == torch.device('cpu'):
         use_half = False
 
+    print(f"PROPAINTER_STAGE: Reading video frames...", flush=True)
     frames, fps, size, video_name = read_frame_from_videos(args.video)
     if not args.width == -1 and not args.height == -1:
         size = (args.width, args.height)
@@ -228,6 +242,7 @@ if __name__ == '__main__':
         size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
 
     frames, size, out_size = resize_frames(frames, size)
+    print(f"PROPAINTER_STAGE: Read {len(frames)} frames ({size[0]}x{size[1]})", flush=True)
     
     fps = args.save_fps if fps is None else fps
     save_root = os.path.join(args.output, video_name)
@@ -236,6 +251,7 @@ if __name__ == '__main__':
 
     if args.mode == 'video_inpainting':
         frames_len = len(frames)
+        print(f"PROPAINTER_STAGE: Reading masks...", flush=True)
         flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
                                               flow_mask_dilates=args.mask_dilation,
                                               mask_dilates=args.mask_dilation)
@@ -260,6 +276,7 @@ if __name__ == '__main__':
         fuse_img = mask_ * fuse_img + (1-mask_)*img
         masked_frame_for_save.append(fuse_img.astype(np.uint8))
 
+    print(f"PROPAINTER_STAGE: Converting to tensors & moving to {device}...", flush=True)
     frames_inp = [np.array(f).astype(np.uint8) for f in frames]
     frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
     flow_masks = to_tensors()(flow_masks).unsqueeze(0)
@@ -270,10 +287,12 @@ if __name__ == '__main__':
     ##############################################
     # set up RAFT and flow competition model
     ##############################################
+    print(f"PROPAINTER_STAGE: Loading RAFT model...", flush=True)
     ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'raft-things.pth'), 
                                     model_dir='weights', progress=True, file_name=None)
     fix_raft = RAFT_bi(ckpt_path, device)
     
+    print(f"PROPAINTER_STAGE: Loading flow completion model...", flush=True)
     ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'recurrent_flow_completion.pth'), 
                                     model_dir='weights', progress=True, file_name=None)
     fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
@@ -286,6 +305,7 @@ if __name__ == '__main__':
     ##############################################
     # set up ProPainter model
     ##############################################
+    print(f"PROPAINTER_STAGE: Loading ProPainter model...", flush=True)
     ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'ProPainter.pth'), 
                                     model_dir='weights', progress=True, file_name=None)
     model = InpaintGenerator(model_path=ckpt_path).to(device)
@@ -296,17 +316,19 @@ if __name__ == '__main__':
     # ProPainter inference
     ##############################################
     video_length = frames.size(1)
-    print(f'\nProcessing: {video_name} [{video_length} frames]...')
+    print(f'PROPAINTER_STAGE: Starting inference on {video_length} frames...', flush=True)
     with torch.no_grad():
         # ---- compute flow ----
+        print(f"PROPAINTER_STAGE: Computing optical flow (RAFT)...", flush=True)
+        # Aggressively reduce clip lengths for 8GB VRAM to prevent system RAM spilling
         if frames.size(-1) <= 640: 
-            short_clip_len = 12
-        elif frames.size(-1) <= 720: 
-            short_clip_len = 8
-        elif frames.size(-1) <= 1280:
             short_clip_len = 4
-        else:
+        elif frames.size(-1) <= 720: 
             short_clip_len = 2
+        elif frames.size(-1) <= 1280:
+            short_clip_len = 1
+        else:
+            short_clip_len = 1
         
         # use fp32 for RAFT
         if frames.size(1) > short_clip_len:
@@ -318,6 +340,9 @@ if __name__ == '__main__':
                 else:
                     flows_f, flows_b = fix_raft(frames[:,f-1:end_f], iters=args.raft_iter)
                 
+                if use_half:
+                    flows_f, flows_b = flows_f.half(), flows_b.half()
+                    
                 gt_flows_f_list.append(flows_f)
                 gt_flows_b_list.append(flows_b)
                 torch.cuda.empty_cache()
@@ -338,6 +363,7 @@ if __name__ == '__main__':
 
         
         # ---- complete flow ----
+        print(f"PROPAINTER_STAGE: Completing flow...", flush=True)
         flow_length = gt_flows_bi[0].size(1)
         if flow_length > args.subvideo_length:
             pred_flows_f, pred_flows_b = [], []
@@ -369,6 +395,7 @@ if __name__ == '__main__':
             
 
         # ---- image propagation ----
+        print(f"PROPAINTER_STAGE: Image propagation...", flush=True)
         masked_frames = frames * (1 - masks_dilated)
         subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
         if video_length > subvideo_length_img_prop:
@@ -414,7 +441,9 @@ if __name__ == '__main__':
         ref_num = -1
     
     # ---- feature propagation + transformer ----
-    for f in tqdm(range(0, video_length, neighbor_stride)):
+    print(f"PROPAINTER_STAGE: Feature propagation + transformer...", flush=True)
+    for f in range(0, video_length, neighbor_stride):
+        print(f"PROPAINTER_PROGRESS: {f} / {video_length}", flush=True)
         neighbor_ids = [
             i for i in range(max(0, f - neighbor_stride),
                                 min(video_length, f + neighbor_stride + 1))

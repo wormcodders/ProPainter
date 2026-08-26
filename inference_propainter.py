@@ -362,14 +362,22 @@ if __name__ == '__main__':
         # ---- complete flow ----
         print(f"PROPAINTER_STAGE: Completing flow...", flush=True)
         flow_length = gt_flows_bi[0].size(1)
-        if flow_length > args.subvideo_length:
+        
+        # Dynamically calculate safe flow completion chunk size based on resolution to prevent OOM
+        # 480p (854x480) area is ~410k pixels. 1080p is ~2M pixels (5x larger).
+        area = frames.size(-1) * frames.size(-2)
+        safe_flow_chunk = max(15, int(args.subvideo_length * (410000 / area)))
+        if not use_half:
+            safe_flow_chunk = max(10, safe_flow_chunk // 2)
+
+        if flow_length > safe_flow_chunk:
             pred_flows_f, pred_flows_b = [], []
             pad_len = 5
-            for f in range(0, flow_length, args.subvideo_length):
+            for f in range(0, flow_length, safe_flow_chunk):
                 s_f = max(0, f - pad_len)
-                e_f = min(flow_length, f + args.subvideo_length + pad_len)
+                e_f = min(flow_length, f + safe_flow_chunk + pad_len)
                 pad_len_s = max(0, f) - s_f
-                pad_len_e = e_f - min(flow_length, f + args.subvideo_length)
+                pad_len_e = e_f - min(flow_length, f + safe_flow_chunk)
                 pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
                     (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
                     flow_masks[:, s_f:e_f+1])
@@ -394,7 +402,14 @@ if __name__ == '__main__':
         # ---- image propagation ----
         print(f"PROPAINTER_STAGE: Image propagation...", flush=True)
         masked_frames = frames * (1 - masks_dilated)
-        subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
+        
+        # Dynamically scale propagation chunk size
+        safe_prop_chunk = max(15, int(args.subvideo_length * (410000 / area)))
+        if not use_half:
+            safe_prop_chunk = max(10, safe_prop_chunk // 2)
+            
+        subvideo_length_img_prop = min(100, safe_prop_chunk) 
+        
         if video_length > subvideo_length_img_prop:
             updated_frames, updated_masks = [], []
             pad_len = 10

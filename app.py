@@ -135,11 +135,31 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
         
         if max_resolution != "Original":
             try:
-                res_part = max_resolution.split(" ")[0]
-                w, h = res_part.split("x")
-                cmd.extend(["--width", w, "--height", h])
-            except Exception:
-                pass
+                # Get max dimension
+                if "720p" in max_resolution: max_dim = 1280
+                elif "540p" in max_resolution: max_dim = 960
+                elif "480p" in max_resolution: max_dim = 854
+                else: max_dim = 1280
+                
+                # Get original video dimensions
+                cap = cv2.VideoCapture(vid_path)
+                orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+                
+                if orig_w > 0 and orig_h > 0:
+                    # Calculate scaling factor to fit within max_dim
+                    scale = min(max_dim / orig_w, max_dim / orig_h, 1.0)
+                    new_w = int(orig_w * scale)
+                    new_h = int(orig_h * scale)
+                    
+                    # Round to nearest multiple of 16 to prevent ffmpeg/imageio macro_block_size issues
+                    new_w = max(16, (new_w // 16) * 16)
+                    new_h = max(16, (new_h // 16) * 16)
+                    
+                    cmd.extend(["--width", str(new_w), "--height", str(new_h)])
+            except Exception as e:
+                yield f"Warning: Failed to calculate proportional resolution: {e}\n", final_output_paths
 
         if fp16:
             cmd.append("--fp16")
@@ -228,13 +248,73 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
             if out_files:
                 out_files.sort(key=os.path.getmtime, reverse=True)
                 best_out = out_files[0]
-                shutil.move(best_out, target_output_path)
+                
+                # Restore Audio using ffmpeg
+                try:
+                    import imageio_ffmpeg
+                    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                    temp_audio_out = os.path.join(expected_result_dir, "audio_merged.mp4")
+                    
+                    # -i best_out (video), -i vid_path (original video for audio)
+                    # -c:v copy (copy video stream without re-encoding)
+                    # -c:a aac (encode audio)
+                    # -map 0:v:0 (take first video stream from first input)
+                    # -map 1:a:0? (take first audio stream from second input, ? means optional if no audio exists)
+                    # -shortest (finish encoding when shortest stream ends)
+                    ff_cmd = [
+                        ffmpeg_exe, "-y",
+                        "-i", best_out,
+                        "-i", vid_path,
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-map", "0:v:0",
+                        "-map", "1:a:0?",
+                        temp_audio_out
+                    ]
+                    
+                    ff_proc = subprocess.run(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if ff_proc.returncode == 0 and os.path.exists(temp_audio_out):
+                        shutil.move(temp_audio_out, target_output_path)
+                    else:
+                        err = ff_proc.stderr.decode('utf-8', errors='ignore')
+                        log_output += f"Warning: ffmpeg audio merge failed (code {ff_proc.returncode}):\n{err}\n"
+                        shutil.move(best_out, target_output_path)
+                except Exception as e:
+                    log_output += f"Warning: Failed to merge audio exception: {e}\n"
+                    shutil.move(best_out, target_output_path)
+                    
                 output_found = True
         
         if not output_found:
             alt_out = os.path.join("results", f"{vid_name_no_ext}.mp4")
             if os.path.exists(alt_out):
-                shutil.move(alt_out, target_output_path)
+                # Restore Audio using ffmpeg
+                try:
+                    import imageio_ffmpeg
+                    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                    temp_audio_out = os.path.join("results", "audio_merged.mp4")
+                    
+                    ff_cmd = [
+                        ffmpeg_exe, "-y",
+                        "-i", alt_out,
+                        "-i", vid_path,
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-map", "0:v:0",
+                        "-map", "1:a:0?",
+                        temp_audio_out
+                    ]
+                    
+                    ff_proc = subprocess.run(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if ff_proc.returncode == 0 and os.path.exists(temp_audio_out):
+                        shutil.move(temp_audio_out, target_output_path)
+                    else:
+                        err = ff_proc.stderr.decode('utf-8', errors='ignore')
+                        log_output += f"Warning: ffmpeg audio merge failed (code {ff_proc.returncode}):\n{err}\n"
+                        shutil.move(alt_out, target_output_path)
+                except Exception as e:
+                    log_output += f"Warning: Failed to merge audio exception: {e}\n"
+                    shutil.move(alt_out, target_output_path)
                 output_found = True
         
         if output_found:
@@ -249,7 +329,9 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                 shutil.rmtree(expected_result_dir)
             if current_mask_path and os.path.basename(current_mask_path) == "temp_drawn_mask.png" and os.path.exists(current_mask_path):
                 os.remove(current_mask_path)
-            log_output += "Cleaned up temporary files.\n"
+            if os.path.exists(vid_path):
+                os.remove(vid_path)
+            log_output += "Cleaned up temporary files and original input video.\n"
         except Exception as e:
             log_output += f"Warning: Failed to clean up temp files: {e}\n"
             

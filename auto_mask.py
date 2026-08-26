@@ -10,8 +10,10 @@ def generate_auto_mask(image_np, x, y):
     loads MobileSAM, generates a binary mask, unloads the model to free VRAM,
     and returns a visual overlay image and the raw mask.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    if not torch.cuda.is_available():
+        raise RuntimeError("No GPU detected! Auto-masking requires a GPU.")
+    device = "cuda"
+
     # Load lightweight MobileSAM
     model = SAM('mobile_sam.pt')
     

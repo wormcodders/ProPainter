@@ -73,8 +73,11 @@ def get_device(gpu_id=None):
     if IS_HIGH_VERSION:
         if torch.backends.mps.is_available():
             return torch.device('mps'+gpu_str)
-    return torch.device('cuda'+gpu_str if torch.cuda.is_available() and torch.backends.cudnn.is_available() else 'cpu')
-
+            
+    if torch.cuda.is_available() and torch.backends.cudnn.is_available():
+        return torch.device('cuda'+gpu_str)
+        
+    raise RuntimeError("CRITICAL ERROR: No supported GPU detected (CUDA or MPS). This application strictly requires a GPU to run. CPU fallback has been disabled.")
 
 def set_random_seed(seed):
     """Set random seeds."""

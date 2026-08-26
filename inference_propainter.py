@@ -102,22 +102,22 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
         if size is not None:
             mask_img = mask_img.resize(size, Image.NEAREST)
         mask_img = np.array(mask_img.convert('L'))
+        mask_img = binary_mask(mask_img).astype(np.uint8)
 
         # Dilate 8 pixel so that all known pixel is trustworthy
         if flow_mask_dilates > 0:
             flow_mask_img = cv2.dilate(mask_img, np.ones((3, 3), np.uint8), iterations=flow_mask_dilates)
         else:
-            flow_mask_img = binary_mask(mask_img).astype(np.uint8)
-        # Close the small holes inside the foreground objects
-        # flow_mask_img = cv2.morphologyEx(flow_mask_img, cv2.MORPH_CLOSE, np.ones((21, 21),np.uint8)).astype(bool)
-        # flow_mask_img = scipy.ndimage.binary_fill_holes(flow_mask_img).astype(np.uint8)
+            flow_mask_img = mask_img
+            
         flow_masks.append(Image.fromarray(flow_mask_img * 255))
         
         if mask_dilates > 0:
-            mask_img = cv2.dilate(mask_img, np.ones((3, 3), np.uint8), iterations=mask_dilates)
+            mask_img_dilated = cv2.dilate(mask_img, np.ones((3, 3), np.uint8), iterations=mask_dilates)
         else:
-            mask_img = binary_mask(mask_img).astype(np.uint8)
-        masks_dilated.append(Image.fromarray(mask_img * 255))
+            mask_img_dilated = mask_img
+            
+        masks_dilated.append(Image.fromarray(mask_img_dilated * 255))
     
     if len(masks_img) == 1:
         flow_masks = flow_masks * length
@@ -321,14 +321,11 @@ if __name__ == '__main__':
         # ---- compute flow ----
         print(f"PROPAINTER_STAGE: Computing optical flow (RAFT)...", flush=True)
         # Aggressively reduce clip lengths for 8GB VRAM to prevent system RAM spilling
+        # Note: short_clip_len MUST be >= 2, because RAFT computes flow between pairs of frames!
         if frames.size(-1) <= 640: 
             short_clip_len = 4
-        elif frames.size(-1) <= 720: 
-            short_clip_len = 2
-        elif frames.size(-1) <= 1280:
-            short_clip_len = 1
         else:
-            short_clip_len = 1
+            short_clip_len = 2
         
         # use fp32 for RAFT
         if frames.size(1) > short_clip_len:

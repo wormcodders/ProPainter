@@ -13,8 +13,20 @@ import torchvision
 # Workarounds for Blackwell (RTX 50-series) CUBLAS compatibility
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    device_name = torch.cuda.get_device_name(0).lower()
+    major, minor = torch.cuda.get_device_capability(0)
+    
+    # Fix for CUBLAS_STATUS_INTERNAL_ERROR in torch.matmul (corr.py) on newer architectures
+    if major >= 8:  # Ampere (30-series), Ada (40-series), Blackwell (50-series)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+    # Nuclear fix for Blackwell CUDNN_STATUS_EXECUTION_FAILED_CUDART in F.conv2d
+    if "rtx 50" in device_name or "rtx 40" in device_name or major >= 10:
+        torch.backends.cudnn.enabled = False
+    else:
+        # For Kaggle T4 and older stable GPUs, use full speed cuDNN
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
 
 from model.modules.flow_comp_raft import RAFT_bi
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
@@ -23,6 +35,11 @@ from utils.download_util import load_file_from_url
 from core.utils import to_tensors
 from model.misc import get_device
 
+def log_vram(stage_name=""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        print(f"[VRAM DEBUG] {stage_name} | Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB", flush=True)
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -54,17 +71,13 @@ def resize_frames(frames, size=None):
 def read_frame_from_videos(frame_root):
     if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
         video_name = os.path.basename(frame_root)[:-4]
-        import cv2
-        cap = cv2.VideoCapture(frame_root)
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        reader = imageio.get_reader(frame_root)
+        fps = reader.get_meta_data().get('fps', 24)
         frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        for frame in reader:
+            # imageio returns frames in RGB format natively
             frames.append(Image.fromarray(frame))
-        cap.release()
+        reader.close()
     else:
         video_name = os.path.basename(frame_root)
         frames = []
@@ -241,6 +254,16 @@ if __name__ == '__main__':
     if not args.resize_ratio == 1.0:
         size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
 
+    # Safety cap: auto-downscale only for 4K+ resolutions that physically cannot fit in T4 VRAM
+    MAX_SAFE_DIM = 1920
+    if args.width == -1 and args.height == -1 and max(size[0], size[1]) > MAX_SAFE_DIM:
+        native_w, native_h = size
+        sf = MAX_SAFE_DIM / max(native_w, native_h)
+        safe_w = max(16, (int(native_w * sf) // 16) * 16)
+        safe_h = max(16, (int(native_h * sf) // 16) * 16)
+        size = (safe_w, safe_h)
+        print(f"PROPAINTER_STAGE: Auto-downscaling from {native_w}x{native_h} to {safe_w}x{safe_h} (4K+ exceeds GPU limits)", flush=True)
+
     frames, size, out_size = resize_frames(frames, size)
     print(f"PROPAINTER_STAGE: Read {len(frames)} frames ({size[0]}x{size[1]})", flush=True)
     
@@ -276,12 +299,34 @@ if __name__ == '__main__':
         fuse_img = mask_ * fuse_img + (1-mask_)*img
         masked_frame_for_save.append(fuse_img.astype(np.uint8))
 
-    print(f"PROPAINTER_STAGE: Converting to tensors & moving to {device}...", flush=True)
-    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
-    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
-    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
+    # VRAM Offload Optimization: Use CUDA 1 if available, otherwise System RAM (CPU) for storing massive master tensors
+    storage_device = torch.device('cuda:1') if torch.cuda.device_count() > 1 else torch.device('cpu')
+    print(f"PROPAINTER_STAGE: Converting to tensors & moving to storage {storage_device}...", flush=True)
+    
+    # 1. Optimized Tensor Conversion with Aggressive Garbage Collection to avoid OOM Killer (-9)
+    from torchvision.transforms.functional import to_tensor
+    t_frames = len(frames)
+    w, h = size
+    
+    frames_t = torch.empty((1, t_frames, 3, h, w), dtype=torch.float32, device=storage_device)
+    flow_masks_t = torch.empty((1, t_frames, 1, h, w), dtype=torch.float32, device=storage_device)
+    masks_dilated_t = torch.empty((1, t_frames, 1, h, w), dtype=torch.float32, device=storage_device)
+    frames_inp = []
+    
+    i = 0
+    while frames:
+        # Save to frames_inp
+        frames_inp.append(np.array(frames[0]).astype(np.uint8))
+        
+        # Convert to tensor and immediately free the heavy PIL image from System RAM!
+        frames_t[0, i] = to_tensor(frames.pop(0)).to(storage_device) * 2.0 - 1.0
+        flow_masks_t[0, i] = to_tensor(flow_masks.pop(0)).to(storage_device)
+        masks_dilated_t[0, i] = to_tensor(masks_dilated.pop(0)).to(storage_device)
+        i += 1
+        
+    frames = frames_t
+    flow_masks = flow_masks_t
+    masks_dilated = masks_dilated_t
 
     
     ##############################################
@@ -316,10 +361,29 @@ if __name__ == '__main__':
     # ProPainter inference
     ##############################################
     video_length = frames.size(1)
+    
+    # --- GLOBAL VRAM OOM PREVENTION ---
+    # Dynamically scale chunk sizes based on resolution
+    # 480p (854x480) area is ~410k pixels.
+    area = frames.size(-1) * frames.size(-2)
+    scale_factor = 410000 / area
+    
+    # Scale subvideo_length
+    args.subvideo_length = max(15, int(args.subvideo_length * scale_factor))
+    # Scale neighbor_length (must be even so neighbor_stride works cleanly)
+    args.neighbor_length = max(4, int(args.neighbor_length * scale_factor))
+    args.neighbor_length = args.neighbor_length - (args.neighbor_length % 2)
+    
+    if not use_half:
+        args.subvideo_length = max(10, args.subvideo_length // 2)
+        args.neighbor_length = max(2, args.neighbor_length // 2)
+        args.neighbor_length = args.neighbor_length - (args.neighbor_length % 2)
+        
     print(f'PROPAINTER_STAGE: Starting inference on {video_length} frames...', flush=True)
     with torch.no_grad():
         # ---- compute flow ----
         print(f"PROPAINTER_STAGE: Computing optical flow (RAFT)...", flush=True)
+        log_vram("Pre-RAFT")
         # Aggressively reduce clip lengths for 8GB VRAM to prevent system RAM spilling
         # Note: short_clip_len MUST be >= 2, because RAFT computes flow between pairs of frames!
         if frames.size(-1) <= 640: 
@@ -333,83 +397,88 @@ if __name__ == '__main__':
             for f in range(0, video_length, short_clip_len):
                 end_f = min(video_length, f + short_clip_len)
                 if f == 0:
-                    flows_f, flows_b = fix_raft(frames[:,f:end_f], iters=args.raft_iter)
+                    flows_f, flows_b = fix_raft(frames[:,f:end_f].to(device), iters=args.raft_iter)
                 else:
-                    flows_f, flows_b = fix_raft(frames[:,f-1:end_f], iters=args.raft_iter)
+                    flows_f, flows_b = fix_raft(frames[:,f-1:end_f].to(device), iters=args.raft_iter)
                 
                 if use_half:
                     flows_f, flows_b = flows_f.half(), flows_b.half()
                     
-                gt_flows_f_list.append(flows_f)
-                gt_flows_b_list.append(flows_b)
+                gt_flows_f_list.append(flows_f.to(storage_device))
+                gt_flows_b_list.append(flows_b.to(storage_device))
                 torch.cuda.empty_cache()
                 
             gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
             gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
             gt_flows_bi = (gt_flows_f, gt_flows_b)
         else:
-            gt_flows_bi = fix_raft(frames, iters=args.raft_iter)
+            gt_flows_bi = fix_raft(frames.to(device), iters=args.raft_iter)
+            if use_half:
+                gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+            gt_flows_bi = (gt_flows_bi[0].to(storage_device), gt_flows_bi[1].to(storage_device))
             torch.cuda.empty_cache()
 
-
         if use_half:
-            frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
-            gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+            # Conversion happens safely on the storage device (CPU/CUDA1) to avoid CUDA0 OOM
+            frames = frames.half()
+            flow_masks = flow_masks.half()
+            masks_dilated = masks_dilated.half()
+            
             fix_flow_complete = fix_flow_complete.half()
             model = model.half()
-
+            torch.cuda.empty_cache()
         
         # ---- complete flow ----
         print(f"PROPAINTER_STAGE: Completing flow...", flush=True)
+        log_vram("Pre-Flow-Completion")
         flow_length = gt_flows_bi[0].size(1)
-        
-        # Dynamically calculate safe flow completion chunk size based on resolution to prevent OOM
-        # 480p (854x480) area is ~410k pixels. 1080p is ~2M pixels (5x larger).
-        area = frames.size(-1) * frames.size(-2)
-        safe_flow_chunk = max(15, int(args.subvideo_length * (410000 / area)))
-        if not use_half:
-            safe_flow_chunk = max(10, safe_flow_chunk // 2)
 
-        if flow_length > safe_flow_chunk:
+        if flow_length > args.subvideo_length:
             pred_flows_f, pred_flows_b = [], []
             pad_len = 5
-            for f in range(0, flow_length, safe_flow_chunk):
+            for f in range(0, flow_length, args.subvideo_length):
                 s_f = max(0, f - pad_len)
-                e_f = min(flow_length, f + safe_flow_chunk + pad_len)
+                e_f = min(flow_length, f + args.subvideo_length + pad_len)
                 pad_len_s = max(0, f) - s_f
-                pad_len_e = e_f - min(flow_length, f + safe_flow_chunk)
+                pad_len_e = e_f - min(flow_length, f + args.subvideo_length)
+                
+                gt_f_sub = gt_flows_bi[0][:, s_f:e_f].to(device)
+                gt_b_sub = gt_flows_bi[1][:, s_f:e_f].to(device)
+                mask_sub = flow_masks[:, s_f:e_f+1].to(device)
+                
                 pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
-                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
-                    flow_masks[:, s_f:e_f+1])
+                    (gt_f_sub, gt_b_sub), mask_sub)
                 pred_flows_bi_sub = fix_flow_complete.combine_flow(
-                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
-                    pred_flows_bi_sub, 
-                    flow_masks[:, s_f:e_f+1])
+                    (gt_f_sub, gt_b_sub), pred_flows_bi_sub, mask_sub)
 
-                pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f-s_f-pad_len_e])
-                pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f-s_f-pad_len_e])
+                pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f-s_f-pad_len_e].to(storage_device))
+                pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f-s_f-pad_len_e].to(storage_device))
                 torch.cuda.empty_cache()
                 
             pred_flows_f = torch.cat(pred_flows_f, dim=1)
             pred_flows_b = torch.cat(pred_flows_b, dim=1)
             pred_flows_bi = (pred_flows_f, pred_flows_b)
         else:
-            pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
-            pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
+            gt_f_sub = gt_flows_bi[0].to(device)
+            gt_b_sub = gt_flows_bi[1].to(device)
+            mask_sub = flow_masks.to(device)
+            
+            pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow((gt_f_sub, gt_b_sub), mask_sub)
+            pred_flows_bi = fix_flow_complete.combine_flow((gt_f_sub, gt_b_sub), pred_flows_bi, mask_sub)
+            pred_flows_bi = (pred_flows_bi[0].to(storage_device), pred_flows_bi[1].to(storage_device))
             torch.cuda.empty_cache()
             
+        # Free massive tensors and models that are no longer needed
+        del gt_flows_bi
+        del flow_masks
+        del fix_raft
+        del fix_flow_complete
+        torch.cuda.empty_cache()
 
         # ---- image propagation ----
         print(f"PROPAINTER_STAGE: Image propagation...", flush=True)
-        masked_frames = frames * (1 - masks_dilated)
-        
-        # Dynamically scale propagation chunk size
-        safe_prop_chunk = max(15, int(args.subvideo_length * (410000 / area)))
-        if not use_half:
-            safe_prop_chunk = max(10, safe_prop_chunk // 2)
-            
-        subvideo_length_img_prop = min(100, safe_prop_chunk) 
-        
+        log_vram("Pre-Image-Propagation")
+        subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
         if video_length > subvideo_length_img_prop:
             updated_frames, updated_masks = [], []
             pad_len = 10
@@ -419,29 +488,44 @@ if __name__ == '__main__':
                 pad_len_s = max(0, f) - s_f
                 pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
 
-                b, t, _, _, _ = masks_dilated[:, s_f:e_f].size()
-                pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1], pred_flows_bi[1][:, s_f:e_f-1])
-                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(masked_frames[:, s_f:e_f], 
-                                                                       pred_flows_bi_sub, 
-                                                                       masks_dilated[:, s_f:e_f], 
-                                                                       'nearest')
-                updated_frames_sub = frames[:, s_f:e_f] * (1 - masks_dilated[:, s_f:e_f]) + \
-                                    prop_imgs_sub.view(b, t, 3, h, w) * masks_dilated[:, s_f:e_f]
+                # Move chunks to active GPU device
+                mask_sub = masks_dilated[:, s_f:e_f].to(device)
+                frame_sub = frames[:, s_f:e_f].to(device)
+                masked_frame_sub = frame_sub * (1 - mask_sub)
+                
+                b, t, _, _, _ = mask_sub.size()
+                pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1].to(device), pred_flows_bi[1][:, s_f:e_f-1].to(device))
+                
+                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(
+                    masked_frame_sub, pred_flows_bi_sub, mask_sub, 'nearest')
+                    
+                updated_frames_sub = frame_sub * (1 - mask_sub) + \
+                                    prop_imgs_sub.view(b, t, 3, h, w) * mask_sub
                 updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
                 
-                updated_frames.append(updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e])
-                updated_masks.append(updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e])
+                updated_frames.append(updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e].to(storage_device))
+                updated_masks.append(updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e].to(storage_device))
                 torch.cuda.empty_cache()
                 
             updated_frames = torch.cat(updated_frames, dim=1)
             updated_masks = torch.cat(updated_masks, dim=1)
         else:
-            b, t, _, _, _ = masks_dilated.size()
-            prop_imgs, updated_local_masks = model.img_propagation(masked_frames, pred_flows_bi, masks_dilated, 'nearest')
-            updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
+            mask_sub = masks_dilated.to(device)
+            frame_sub = frames.to(device)
+            masked_frame_sub = frame_sub * (1 - mask_sub)
+            pred_flows_bi_sub = (pred_flows_bi[0].to(device), pred_flows_bi[1].to(device))
+            
+            b, t, _, _, _ = mask_sub.size()
+            prop_imgs, updated_local_masks = model.img_propagation(masked_frame_sub, pred_flows_bi_sub, mask_sub, 'nearest')
+            updated_frames = frame_sub * (1 - mask_sub) + prop_imgs.view(b, t, 3, h, w) * mask_sub
             updated_masks = updated_local_masks.view(b, t, 1, h, w)
+            updated_frames = updated_frames.to(storage_device)
+            updated_masks = updated_masks.to(storage_device)
             torch.cuda.empty_cache()
             
+        # Free massive tensors that are no longer needed
+        del frames
+        torch.cuda.empty_cache()
     
     ori_frames = frames_inp
     comp_frames = [None] * video_length
@@ -454,6 +538,7 @@ if __name__ == '__main__':
     
     # ---- feature propagation + transformer ----
     print(f"PROPAINTER_STAGE: Feature propagation + transformer...", flush=True)
+    log_vram("Pre-Feature-Propagation")
     for f in range(0, video_length, neighbor_stride):
         print(f"PROPAINTER_PROGRESS: {f} / {video_length}", flush=True)
         neighbor_ids = [
@@ -461,10 +546,10 @@ if __name__ == '__main__':
                                 min(video_length, f + neighbor_stride + 1))
         ]
         ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
-        selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
-        selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :]
-        selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
-        selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :], pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :])
+        selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :].to(device)
+        selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :].to(device)
+        selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :].to(device)
+        selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :].to(device), pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :].to(device))
         
         with torch.no_grad():
             # 1.0 indicates mask
@@ -490,6 +575,9 @@ if __name__ == '__main__':
                     
                 comp_frames[idx] = comp_frames[idx].astype(np.uint8)
         
+        # Aggressively free CUDA:0 VRAM between transformer steps
+        del selected_imgs, selected_masks, selected_update_masks, selected_pred_flows_bi
+        del pred_img
         torch.cuda.empty_cache()
                 
     # save each frame

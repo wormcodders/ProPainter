@@ -14,3 +14,7 @@ pyyaml
 requests
 timm
 yapf
+gradio
+piexif
+simple-lama-inpainting
+onnxruntime-gpuimageio

@@ -30,6 +30,11 @@ def generate_auto_mask(image_np, x, y):
     # Create binary mask (255 for foreground, 0 for background)
     binary_mask = (mask_data * 255).astype(np.uint8)
     
+    # Dilate the mask to slightly expand its borders (solves MobileSAM skipping fuzzy watermark edges)
+    # 5x5 kernel with 3 iterations adds roughly a 6-pixel buffer around the entire shape
+    kernel = np.ones((5, 5), np.uint8)
+    binary_mask = cv2.dilate(binary_mask, kernel, iterations=3)
+    
     # Unload model explicitly to free VRAM for ProPainter
     del model
     del results

@@ -384,39 +384,31 @@ if __name__ == '__main__':
         # ---- compute flow ----
         print(f"PROPAINTER_STAGE: Computing optical flow (RAFT)...", flush=True)
         log_vram("Pre-RAFT")
-        # Aggressively reduce clip lengths for 8GB VRAM to prevent system RAM spilling
-        # Note: short_clip_len MUST be >= 2, because RAFT computes flow between pairs of frames!
-        if frames.size(-1) <= 640: 
-            short_clip_len = 4
-        else:
-            short_clip_len = 2
-        
         # use fp32 for RAFT
-        if frames.size(1) > short_clip_len:
-            gt_flows_f_list, gt_flows_b_list = [], []
-            for f in range(0, video_length, short_clip_len):
-                end_f = min(video_length, f + short_clip_len)
-                if f == 0:
-                    flows_f, flows_b = fix_raft(frames[:,f:end_f].to(device), iters=args.raft_iter)
-                else:
-                    flows_f, flows_b = fix_raft(frames[:,f-1:end_f].to(device), iters=args.raft_iter)
-                
-                if use_half:
-                    flows_f, flows_b = flows_f.half(), flows_b.half()
-                    
-                gt_flows_f_list.append(flows_f.to(storage_device))
-                gt_flows_b_list.append(flows_b.to(storage_device))
-                torch.cuda.empty_cache()
-                
-            gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
-            gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
-            gt_flows_bi = (gt_flows_f, gt_flows_b)
+        gt_flows_f_list, gt_flows_b_list = [], []
+        
+        # Dynamically determine RAFT batch size based on resolution
+        if frames.size(-1) <= 640:
+            batch_size = 4
+        elif frames.size(-1) <= 1280:
+            batch_size = 2
         else:
-            gt_flows_bi = fix_raft(frames.to(device), iters=args.raft_iter)
+            batch_size = 1 # CRITICAL: 1080p must use batch size 1 to prevent OOM
+            
+        for f in range(0, video_length - 1, batch_size):
+            end_f = min(video_length, f + batch_size + 1)
+            flows_f, flows_b = fix_raft(frames[:, f:end_f].to(device), iters=args.raft_iter)
+            
             if use_half:
-                gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-            gt_flows_bi = (gt_flows_bi[0].to(storage_device), gt_flows_bi[1].to(storage_device))
+                flows_f, flows_b = flows_f.half(), flows_b.half()
+                
+            gt_flows_f_list.append(flows_f.to(storage_device))
+            gt_flows_b_list.append(flows_b.to(storage_device))
             torch.cuda.empty_cache()
+            
+        gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
+        gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+        gt_flows_bi = (gt_flows_f, gt_flows_b)
 
         if use_half:
             # Conversion happens safely on the storage device (CPU/CUDA1) to avoid CUDA0 OOM

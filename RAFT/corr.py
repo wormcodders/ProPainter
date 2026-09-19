@@ -57,7 +57,8 @@ class CorrBlock:
 
         corr = torch.matmul(fmap1.transpose(1,2).contiguous(), fmap2.contiguous())
         corr = corr.view(batch, ht, wd, 1, ht, wd)
-        return corr  / torch.sqrt(torch.tensor(dim).float())
+        corr.div_(torch.sqrt(torch.tensor(dim).float()))
+        return corr
 
 
 class CorrLayer(torch.autograd.Function):

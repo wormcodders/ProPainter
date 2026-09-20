@@ -543,6 +543,7 @@ with gr.Blocks(title="ProPainter Local GUI") as demo:
                             gr.Markdown("Click **exactly on the watermark** to automatically outline it using AI (MobileSAM).")
                             auto_mask_image = gr.Image(label="Click to Auto-Mask", type="numpy", interactive=True)
                             auto_mask_state = gr.State(None)
+                            clean_frame_state = gr.State(None)
                             
                         with gr.TabItem("Manual Draw"):
                             gr.Markdown("Use the brush tool to paint over the watermark.")
@@ -558,29 +559,46 @@ with gr.Blocks(title="ProPainter Local GUI") as demo:
                     
                     # Automatically update the canvases when a video is uploaded
                     video_input.change(
-                        fn=extract_first_frame, 
+                        fn=lambda v: (lambda f: (f, f, None, f))(extract_first_frame(v)[0]),
                         inputs=video_input, 
-                        outputs=[mask_editor, auto_mask_image, auto_mask_state]
+                        outputs=[mask_editor, auto_mask_image, auto_mask_state, clean_frame_state]
                     )
                     
                     # Allow user to explicitly clear the drawing
                     reset_drawing_btn.click(
-                        fn=extract_first_frame,
+                        fn=lambda v: (lambda f: (f, f, None, f))(extract_first_frame(v)[0]),
                         inputs=video_input,
-                        outputs=[mask_editor, auto_mask_image, auto_mask_state]
+                        outputs=[mask_editor, auto_mask_image, auto_mask_state, clean_frame_state]
                     )
                     
                     # Handle click on Auto-Mask image
-                    def handle_auto_mask_click(evt: gr.SelectData, frame):
-                        if frame is None:
-                            return frame, None
+                    def handle_auto_mask_click(evt: gr.SelectData, clean_frame, current_mask_state):
+                        if clean_frame is None:
+                            return None, None
                         from auto_mask import generate_auto_mask
-                        overlay, mask = generate_auto_mask(frame, evt.index[0], evt.index[1])
-                        return overlay, mask
+                        # Run SAM on the clean frame so previous red overlays don't confuse the model
+                        _, new_mask = generate_auto_mask(clean_frame, evt.index[0], evt.index[1])
+                        
+                        # Accumulate multiple watermark clicks
+                        if current_mask_state is not None:
+                            merged_mask = cv2.bitwise_or(current_mask_state, new_mask)
+                        else:
+                            merged_mask = new_mask
+                            
+                        # Generate the combined visual overlay
+                        final_overlay = clean_frame.copy()
+                        red_layer = np.zeros_like(final_overlay)
+                        red_layer[:, :, 0] = 255
+                        alpha = 0.5
+                        mask_bool = merged_mask > 0
+                        final_overlay[mask_bool] = cv2.addWeighted(final_overlay[mask_bool], 1 - alpha, red_layer[mask_bool], alpha, 0)
+                        cv2.drawMarker(final_overlay, (evt.index[0], evt.index[1]), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=15, thickness=2)
+                        
+                        return final_overlay, merged_mask
         
                     auto_mask_image.select(
                         fn=handle_auto_mask_click,
-                        inputs=[auto_mask_image],
+                        inputs=[clean_frame_state, auto_mask_state],
                         outputs=[auto_mask_image, auto_mask_state]
                     )
                     

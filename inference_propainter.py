@@ -299,8 +299,8 @@ if __name__ == '__main__':
         fuse_img = mask_ * fuse_img + (1-mask_)*img
         masked_frame_for_save.append(fuse_img.astype(np.uint8))
 
-    # VRAM Offload Optimization: Use CUDA 1 if available, otherwise System RAM (CPU) for storing massive master tensors
-    storage_device = torch.device('cuda:1') if torch.cuda.device_count() > 1 else torch.device('cpu')
+    # VRAM Offload Optimization: Use System RAM (CPU) for storing massive master tensors to bypass broken P2P on Kaggle T4x2
+    storage_device = torch.device('cpu')
     print(f"PROPAINTER_STAGE: Converting to tensors & moving to storage {storage_device}...", flush=True)
     
     # 1. Optimized Tensor Conversion with Aggressive Garbage Collection to avoid OOM Killer (-9)

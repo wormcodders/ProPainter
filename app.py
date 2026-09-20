@@ -318,96 +318,154 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                 if not chunks:
                     chunks = [vid_path]
                 
-                processed_chunks = []
-                for chunk_idx, chunk_path in enumerate(chunks):
-                    log_output += f"\n--- Processing Chunk {chunk_idx+1}/{len(chunks)} ---\n"
-                    yield log_output, final_output_paths
+                processed_chunks_dict = {}
+                import queue
+                import threading
+                
+                def enqueue_output(out, q, c_idx, g_id):
+                    for r_line in out:
+                        q.put((c_idx, g_id, r_line))
+                    out.close()
+                    q.put((c_idx, g_id, None))
                     
-                    cmd = [
-                        sys.executable, "-u", "inference_propainter.py",
-                        "--video", chunk_path,
-                        "--mask", current_mask_path,
-                        "--raft_iter", str(int(raft_iters)),
-                        "--subvideo_length", str(int(subvideo_length)),
-                        "--neighbor_length", str(int(neighbor_length))
-                    ]
+                parallel_workers = sys_gpu_count if (sys_gpu_count > 1 and gpu_select == "Auto") else 1
+                if parallel_workers > 1:
+                    log_output += f"\n--- Parallel Mode: Distributing {len(chunks)} chunks across {parallel_workers} GPUs ---\n"
+                else:
+                    log_output += f"\n--- Processing {len(chunks)} chunks sequentially ---\n"
+                yield log_output, final_output_paths
+                
+                active_processes = []
+                q = queue.Queue()
+                threads = []
+                chunk_idx = 0
+                error_occurred = False
+                
+                while chunk_idx < len(chunks) or active_processes:
+                    while len(active_processes) < parallel_workers and chunk_idx < len(chunks) and not error_occurred:
+                        chunk_path = chunks[chunk_idx]
+                        
+                        cmd = [
+                            sys.executable, "-u", "inference_propainter.py",
+                            "--video", chunk_path,
+                            "--mask", current_mask_path,
+                            "--raft_iter", str(int(raft_iters)),
+                            "--subvideo_length", str(int(subvideo_length)),
+                            "--neighbor_length", str(int(neighbor_length))
+                        ]
+                        if resize_args: cmd.extend(resize_args)
+                        if fp16: cmd.append("--fp16")
                     
-                    if resize_args:
-                        cmd.extend(resize_args)
-
-                    if fp16: cmd.append("--fp16")
-                
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-                
-                    if gpu_select and gpu_select != "Auto":
-                        gpu_id = gpu_select.replace("GPU ", "").strip()
-                        env["CUDA_VISIBLE_DEVICES"] = gpu_id
-                
-                    process = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, bufsize=0
-                    )
-
-                    last_pct = -1
-                    for raw_line in process.stdout:
-                        line = raw_line.decode("utf-8", errors="replace")
-                        if "PROPAINTER_DEVICE:" in line:
-                            dev_display = line.strip().split(":")[-1].strip().upper()
-                            log_output += f"\n{'='*50}\n  DEVICE: {dev_display}\n{'='*50}\n\n"
-                            yield log_output, final_output_paths
-                        elif "PROPAINTER_STAGE:" in line:
-                            log_output += f">> {line.strip().split(':', 1)[-1].strip()}\n"
-                            yield log_output, final_output_paths
-                        elif "PROPAINTER_PROGRESS:" in line:
-                            try:
-                                parts = line.strip().split(":")[-1].split("/")
-                                current, total = int(parts[0].strip()), int(parts[1].strip())
-                                pct = current / total
-                                pct_int = int(pct * 100)
-                                overall_pct = ((chunk_idx + pct) / len(chunks)) * 100
-                                progress(overall_pct/100, desc=f"ProPainter Inference (Chunk {chunk_idx+1}/{len(chunks)})")
-                                if pct_int >= last_pct + 10 or pct_int == 0:
-                                    last_pct = pct_int
-                                    filled = int(30 * pct)
-                                    bar = "█" * filled + "░" * (30 - filled)
-                                    log_output += f"  Progress: [{bar}] {pct_int}%  ({current}/{total} steps)\n"
-                                    yield log_output, final_output_paths
-                            except Exception:
-                                pass
+                        env = os.environ.copy()
+                        env["PYTHONUNBUFFERED"] = "1"
+                        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+                        
+                        if parallel_workers > 1:
+                            gpu_to_use = str(chunk_idx % parallel_workers)
+                            env["CUDA_VISIBLE_DEVICES"] = gpu_to_use
+                        elif gpu_select and gpu_select != "Auto":
+                            env["CUDA_VISIBLE_DEVICES"] = gpu_select.replace("GPU ", "").strip()
                         else:
-                            log_output += line
-                            yield log_output, final_output_paths
-
-                    process.wait()
-                    if process.returncode != 0:
-                        log_output += f"\nError: ProPainter exited with code {process.returncode} on chunk {chunk_idx+1}.\n"
+                            gpu_to_use = "0"
+                            
+                        process = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, bufsize=0
+                        )
+                        
+                        g_id_display = env.get("CUDA_VISIBLE_DEVICES", "0")
+                        t = threading.Thread(target=enqueue_output, args=(process.stdout, q, chunk_idx, g_id_display))
+                        t.daemon = True
+                        t.start()
+                        threads.append(t)
+                        
+                        active_processes.append({
+                            "process": process,
+                            "chunk_idx": chunk_idx,
+                            "chunk_path": chunk_path,
+                            "gpu": g_id_display
+                        })
+                        
+                        log_output += f">> Started Chunk {chunk_idx+1}/{len(chunks)} on GPU {g_id_display}\n"
                         yield log_output, final_output_paths
+                        
+                        chunk_idx += 1
+                        
+                    try:
+                        c_idx, g_id, raw_line = q.get(timeout=0.2)
+                        if raw_line is not None:
+                            line = raw_line.decode("utf-8", errors="replace")
+                            prefix = f"[Chunk {c_idx+1}] " if parallel_workers > 1 else ""
+                            
+                            if "PROPAINTER_DEVICE:" in line:
+                                dev_display = line.strip().split(":")[-1].strip().upper()
+                                log_output += f"{prefix}DEVICE: {dev_display}\n"
+                                yield log_output, final_output_paths
+                            elif "PROPAINTER_STAGE:" in line:
+                                log_output += f"{prefix}>> {line.strip().split(':', 1)[-1].strip()}\n"
+                                yield log_output, final_output_paths
+                            elif "PROPAINTER_PROGRESS:" in line:
+                                try:
+                                    parts = line.strip().split(":")[-1].split("/")
+                                    current, total = int(parts[0].strip()), int(parts[1].strip())
+                                    pct = current / total
+                                    pct_int = int(pct * 100)
+                                    
+                                    completed_chunks = len(processed_chunks_dict)
+                                    overall_pct = ((completed_chunks + (pct / len(active_processes))) / len(chunks)) * 100
+                                    progress(overall_pct/100, desc=f"ProPainter Inference ({completed_chunks}/{len(chunks)} chunks done)")
+                                    
+                                    if pct_int % 10 == 0 or pct_int == 100:
+                                        log_output += f"{prefix}Progress: {pct_int}% ({current}/{total})\n"
+                                        yield log_output, final_output_paths
+                                except Exception:
+                                    pass
+                            else:
+                                log_output += f"{prefix}{line}"
+                                yield log_output, final_output_paths
+                    except queue.Empty:
+                        pass
+                        
+                    still_active = []
+                    for p_info in active_processes:
+                        p = p_info["process"]
+                        c_idx = p_info["chunk_idx"]
+                        c_path = p_info["chunk_path"]
+                        
+                        if p.poll() is not None:
+                            if p.returncode != 0:
+                                log_output += f"\nError: ProPainter exited with code {p.returncode} on chunk {c_idx+1}.\n"
+                                yield log_output, final_output_paths
+                                error_occurred = True
+                            else:
+                                chunk_name = os.path.splitext(os.path.basename(c_path))[0]
+                                chunk_result_dir = os.path.join("results", chunk_name)
+                                chunk_out_path = os.path.join(segments_dir, f"processed_{c_idx:04d}.mp4")
+                                default_out = os.path.join(chunk_result_dir, "inpaint_out.mp4")
+                                if os.path.exists(default_out):
+                                    import shutil
+                                    shutil.move(default_out, chunk_out_path)
+                                    processed_chunks_dict[c_idx] = chunk_out_path
+                                    try: shutil.rmtree(chunk_result_dir)
+                                    except: pass
+                                log_output += f">> Finished Chunk {c_idx+1}/{len(chunks)}!\n"
+                                yield log_output, final_output_paths
+                        else:
+                            still_active.append(p_info)
+                            
+                    active_processes = still_active
+                    
+                    if error_occurred and not active_processes:
                         break
                         
-                    # ProPainter saves output to results/<chunk_name>/inpaint_out.mp4
-                    chunk_name = os.path.splitext(os.path.basename(chunk_path))[0]
-                    chunk_result_dir = os.path.join("results", chunk_name)
-                    chunk_out_path = os.path.join(segments_dir, f"processed_{chunk_idx:04d}.mp4")
-                    default_out = os.path.join(chunk_result_dir, "inpaint_out.mp4")
-                    if os.path.exists(default_out):
-                        import shutil
-                        shutil.move(default_out, chunk_out_path)
-                        processed_chunks.append(chunk_out_path)
-                        # Clean up chunk result directory
-                        try:
-                            shutil.rmtree(chunk_result_dir)
-                        except Exception:
-                            pass
-                
-                if len(processed_chunks) < len(chunks):
-                    # Inference failed on a chunk
+                if error_occurred or len(processed_chunks_dict) < len(chunks):
                     with registry_lock:
                         for j in job_registry:
                             if j["id"] == job_id:
                                 j["status"] = "❌ Failed (ProPainter Error)"
                     continue
                     
+                processed_chunks = [processed_chunks_dict[i] for i in range(len(chunks))]
+                
                 log_output += f"\n--- Stitching {len(processed_chunks)} chunks back together ---\n"
                 yield log_output, final_output_paths
                 

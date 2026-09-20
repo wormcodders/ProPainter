@@ -538,10 +538,16 @@ if __name__ == '__main__':
                                 min(video_length, f + neighbor_stride + 1))
         ]
         ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
-        selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :].to(device)
-        selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :].to(device)
-        selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :].to(device)
-        selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :].to(device), pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :].to(device))
+        idx_tensor = torch.tensor(neighbor_ids + ref_ids, device=storage_device)
+        idx_tensor_flow = torch.tensor(neighbor_ids[:-1], device=storage_device)
+        
+        selected_imgs = updated_frames.index_select(1, idx_tensor).to(device)
+        selected_masks = masks_dilated.index_select(1, idx_tensor).to(device)
+        selected_update_masks = updated_masks.index_select(1, idx_tensor).to(device)
+        selected_pred_flows_bi = (
+            pred_flows_bi[0].index_select(1, idx_tensor_flow).to(device), 
+            pred_flows_bi[1].index_select(1, idx_tensor_flow).to(device)
+        )
         
         with torch.no_grad():
             # 1.0 indicates mask

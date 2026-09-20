@@ -362,6 +362,20 @@ if __name__ == '__main__':
     ##############################################
     video_length = frames.size(1)
     
+    # --- CRITICAL FIX FOR 1-FRAME CHUNKS ---
+    # RAFT optical flow requires at least 2 frames. If a chunk has only 1 frame
+    # (e.g. at the very end of the video), we duplicate it to satisfy the temporal math.
+    is_single_frame = False
+    if video_length == 1:
+        print("PROPAINTER_STAGE: Duplicating single-frame chunk to satisfy temporal flow requirements...", flush=True)
+        frames = frames.repeat(1, 2, 1, 1, 1)
+        flow_masks = flow_masks.repeat(1, 2, 1, 1, 1)
+        masks_dilated = masks_dilated.repeat(1, 2, 1, 1, 1)
+        frames_inp.append(frames_inp[0].copy())
+        masked_frame_for_save.append(masked_frame_for_save[0].copy())
+        video_length = 2
+        is_single_frame = True
+    
     # --- GLOBAL VRAM OOM PREVENTION ---
     # Dynamically scale chunk sizes based on resolution
     # 480p (854x480) area is ~410k pixels.
@@ -578,6 +592,11 @@ if __name__ == '__main__':
         del pred_img
         torch.cuda.empty_cache()
                 
+    if is_single_frame:
+        comp_frames = [comp_frames[0]]
+        masked_frame_for_save = [masked_frame_for_save[0]]
+        video_length = 1
+        
     # save each frame
     if args.save_frames:
         for idx in range(video_length):

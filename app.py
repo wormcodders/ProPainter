@@ -46,6 +46,47 @@ def extract_first_frame(videos):
         print(f"Failed to read first frame with imageio: {e}")
         return None, None, None
 
+def setup_rife():
+    import platform
+    import urllib.request
+    import zipfile
+    import requests
+    
+    rife_dir = os.path.join(os.getcwd(), "rife-ncnn-vulkan")
+    sys_os = platform.system().lower()
+    
+    if sys_os == "windows":
+        rife_exe = os.path.join(rife_dir, "rife-ncnn-vulkan-20221029-windows", "rife-ncnn-vulkan.exe")
+        url = "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-windows.zip"
+    else:
+        rife_exe = os.path.join(rife_dir, "rife-ncnn-vulkan-20221029-ubuntu", "rife-ncnn-vulkan")
+        url = "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip"
+        
+    if os.path.exists(rife_exe):
+        return rife_exe
+        
+    os.makedirs(rife_dir, exist_ok=True)
+    zip_path = os.path.join(rife_dir, "rife.zip")
+    
+    try:
+        response = requests.get(url, stream=True, timeout=120)
+        with open(zip_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(rife_dir)
+            
+        if sys_os != "windows":
+            os.chmod(rife_exe, 0o755)
+            
+        try: os.remove(zip_path)
+        except: pass
+        return rife_exe
+    except Exception as e:
+        print(f"Failed to setup RIFE: {e}")
+        return None
+
 def extract_mask_from_editor(mask_dict, mask_path):
     """Extracts the drawing from the ImageEditor layers and saves it as a mask."""
     if not mask_dict or not mask_dict.get("layers"):
@@ -108,7 +149,7 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
         return
 
     do_watermark = "Watermark Removal" in task_selection
-    do_metadata = "Meta Tag Removal / Forge Apple Metadata" in task_selection
+    do_metadata = "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps" in task_selection
 
     final_output_paths = []
 
@@ -197,7 +238,6 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                         cv2.imwrite(target_output_path, result) # This strips metadata natively
                     else:
                         yield f"Skipping watermark removal for {vid_basename} (Processing metadata only)...\n", final_output_paths
-                        import shutil
                         shutil.copy(vid_path, target_output_path)
                         
                     if target_output_path.lower().endswith((".jpg", ".jpeg")):
@@ -442,7 +482,6 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                                 chunk_out_path = os.path.join(segments_dir, f"processed_{c_idx:04d}.mp4")
                                 default_out = os.path.join(chunk_result_dir, "inpaint_out.mp4")
                                 if os.path.exists(default_out):
-                                    import shutil
                                     shutil.move(default_out, chunk_out_path)
                                     processed_chunks_dict[c_idx] = chunk_out_path
                                     try: shutil.rmtree(chunk_result_dir)
@@ -499,9 +538,71 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                     import imageio_ffmpeg
                     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
                     
+                    if do_metadata:
+                        log_output += f"\n--- Initiating RIFE AI Pixel Laundering (Interpolating to 60fps) ---\n"
+                        yield log_output, final_output_paths
+                        
+                        try:
+                            rife_exe = setup_rife()
+                            if rife_exe:
+                                rife_temp_dir = os.path.join(expected_result_dir, "rife_temp")
+                                os.makedirs(rife_temp_dir, exist_ok=True)
+                                rife_in_dir = os.path.join(rife_temp_dir, "in")
+                                rife_out_dir = os.path.join(rife_temp_dir, "out")
+                                os.makedirs(rife_in_dir, exist_ok=True)
+                                os.makedirs(rife_out_dir, exist_ok=True)
+                                
+                                log_output += ">> Extracting frames for RIFE...\n"
+                                yield log_output, final_output_paths
+                                subprocess.run([ffmpeg_exe, "-y", "-i", best_out, os.path.join(rife_in_dir, "%08d.png")], capture_output=True)
+                                
+                                try:
+                                    import imageio
+                                    reader = imageio.get_reader(vid_path)
+                                    orig_fps = float(reader.get_meta_data()['fps'])
+                                    reader.close()
+                                    target_fps = orig_fps * 2
+                                except Exception:
+                                    orig_fps = 30.0
+                                    target_fps = 60.0
+                                
+                                log_output += f">> Running RIFE interpolation (Doubling {orig_fps:.2f}fps to {target_fps:.2f}fps) This will take a while...\n"
+                                yield log_output, final_output_paths
+                                rife_proc = subprocess.run([rife_exe, "-i", rife_in_dir, "-o", rife_out_dir], capture_output=True)
+                                
+                                if rife_proc.returncode == 0:
+                                    log_output += f">> Re-encoding {target_fps:.2f}fps laundered video...\n"
+                                    yield log_output, final_output_paths
+                                    
+                                    rife_vid_out = os.path.join(expected_result_dir, "rife_laundered.mp4")
+                                    subprocess.run([
+                                        ffmpeg_exe, "-y", "-framerate", str(target_fps), 
+                                        "-i", os.path.join(rife_out_dir, "%08d.png"),
+                                        "-r", "60",
+                                        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                                        rife_vid_out
+                                    ], capture_output=True)
+                                    
+                                    if os.path.exists(rife_vid_out):
+                                        best_out = rife_vid_out
+                                        log_output += ">> RIFE Pixel Laundering Complete!\n"
+                                        yield log_output, final_output_paths
+                                else:
+                                    err_out = rife_proc.stderr.decode('utf-8', errors='ignore') if rife_proc.stderr else 'Unknown Error'
+                                    log_output += f"Warning: RIFE failed (code {rife_proc.returncode}). Skipping interpolation.\n"
+                                    yield log_output, final_output_paths
+                            else:
+                                log_output += "Warning: Failed to install RIFE. Skipping interpolation.\n"
+                                yield log_output, final_output_paths
+                        except Exception as e:
+                            log_output += f"Warning: RIFE pipeline error: {e}\n"
+                            yield log_output, final_output_paths
+                    
                     ff_cmd = [ffmpeg_exe, "-y", "-i", best_out]
                     
-                    if do_watermark:
+                    if best_out != vid_path:
+                        # If we processed the video (ProPainter or RIFE), best_out is a new silent video.
+                        # We must stitch the original audio back in.
                         ff_cmd.extend([
                             "-i", vid_path,
                             "-c:v", "copy",
@@ -510,14 +611,23 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                             "-map", "1:a:0?"
                         ])
                     else:
+                        # No video processing occurred, just direct metadata manipulation on the original file
                         ff_cmd.extend(["-c", "copy"])
                         
                     if do_metadata:
                         ff_cmd.extend([
                             "-map_metadata", "-1",
+                            "-map_metadata:s:v", "-1",
+                            "-map_metadata:s:a", "-1",
+                            "-map_chapters", "-1",
+                            "-fflags", "+bitexact",
+                            "-flags", "+bitexact",
+                            "-brand", "qt  ",
+                            "-movflags", "use_metadata_tags",
                             "-metadata", "make=Apple",
                             "-metadata", "model=iPhone 14 Pro",
                             "-metadata", "software=17.0.3",
+                            "-metadata", "creation_time=now",
                             "-metadata:s:v:0", "handler_name=Core Media Video",
                             "-metadata:s:a:0", "handler_name=Core Media Audio"
                         ])
@@ -533,12 +643,10 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                         err = ff_proc.stderr.decode('utf-8', errors='ignore')
                         log_output += f"Warning: ffmpeg process failed (code {ff_proc.returncode}):\n{err}\n"
                         # Fallback copy
-                        import shutil
                         shutil.copy(best_out, target_output_path)
                         output_found = True
                 except Exception as e:
                     log_output += f"Warning: Failed to process video with ffmpeg: {e}\n"
-                    import shutil
                     shutil.copy(best_out, target_output_path)
                     output_found = True                  
         
@@ -585,8 +693,8 @@ with gr.Blocks(title="ProPainter Local GUI") as demo:
                 with gr.Column(scale=1):
                     gr.Markdown("### 1. Select Tasks to Perform")
                     task_selection = gr.CheckboxGroup(
-                        choices=["Watermark Removal", "Meta Tag Removal / Forge Apple Metadata"],
-                        value=["Watermark Removal", "Meta Tag Removal / Forge Apple Metadata"],
+                        choices=["Watermark Removal", "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps"],
+                        value=["Watermark Removal", "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps"],
                         label="Pipeline Tasks"
                     )
                     

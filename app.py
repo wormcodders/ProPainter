@@ -6,8 +6,7 @@ import numpy as np
 import shutil
 import glob
 import sys
-import re
-import torch
+from seedvr2_runner import run_seedvr2_upscale, stream_seedvr2_upscale, setup_seedvr2, DEFAULT_DIT_MODEL
 
 # Auto-detect VRAM to set optimal default parameters
 try:
@@ -32,19 +31,37 @@ else:
     def_raft_iter = 10
 
 def extract_first_frame(videos):
-    """Extracts the first frame of the first uploaded video to use as a drawing canvas."""
+    """Extracts the first frame of the first uploaded video or image to use as a drawing canvas."""
     if not videos:
         return None, None, None
-    vid_path = videos[0].name
+    vid_path = videos[0].name if hasattr(videos[0], 'name') else str(videos[0])
     try:
         import imageio
-        reader = imageio.get_reader(vid_path)
-        frame = reader.get_data(0)  # Gets first frame natively in RGB
-        reader.close()
-        return frame, frame, None
+        try:
+            reader = imageio.get_reader(vid_path)
+            frame = reader.get_data(0)  # Gets first frame natively in RGB
+            reader.close()
+            return frame, frame, None
+        except Exception:
+            frame = cv2.imread(vid_path)
+            if frame is not None:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return frame, frame, None
+            return None, None, None
     except Exception as e:
-        print(f"Failed to read first frame with imageio: {e}")
+        print(f"Failed to read first frame: {e}")
         return None, None, None
+
+def get_media_previews(files):
+    """Generates preview entries (videos or images) for the multi-media preview gallery."""
+    if not files:
+        return gr.update(value=[], visible=False)
+    items = []
+    for f in files:
+        path = f.name if hasattr(f, 'name') else str(f)
+        basename = os.path.basename(path)
+        items.append((path, basename))
+    return gr.update(value=items, visible=True)
 
 def setup_rife():
     import platform
@@ -139,7 +156,13 @@ os.makedirs("results", exist_ok=True)
 registry_lock = threading.Lock()
 job_registry = []
 
-def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, fp16, raft_iters, subvideo_length, neighbor_length, gpu_select, task_selection, progress=gr.Progress(track_tqdm=False)):
+def process_videos(
+    videos, masks, mask_editor, auto_mask_state, max_resolution,
+    fp16, raft_iters, subvideo_length, neighbor_length, gpu_select, task_selection,
+    seedvr2_vid_res=1080, seedvr2_img_res=2160, seedvr2_chunk_size=45,
+    seedvr2_vae_tiled=True, seedvr2_color_corr="lab",
+    progress=gr.Progress(track_tqdm=False)
+):
     if not videos:
         yield "Error: No videos uploaded.", []
         return
@@ -149,6 +172,7 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
         return
 
     do_watermark = "Watermark Removal" in task_selection
+    do_upscale = "SeedVR2 Upscaling" in task_selection
     do_metadata = "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps" in task_selection
 
     final_output_paths = []
@@ -158,7 +182,8 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
         yield f"⏳ Waiting for {gpu_select} to become available... (Queued)\n", []
         
     with gpu_locks[gpu_id]:
-        yield f"✅ [{gpu_select} Acquired!] Starting Batch Processing...\n", []
+        log_output = f"✅ [{gpu_select} Acquired!] Starting Batch Processing ({len(videos)} file{'s' if len(videos) > 1 else ''})...\n"
+        yield log_output, []
 
         # Check if user uploaded a mask file
         uploaded_mask_path = None
@@ -174,12 +199,24 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
         batch_output_dir = os.path.abspath(os.path.join("results", f"batch_{timestamp}"))
         os.makedirs(batch_output_dir, exist_ok=True)
         
-        for video in videos:
+        for idx, video in enumerate(videos):
             vid_path = video.name
             vid_basename = os.path.basename(vid_path)
             vid_name_no_ext, vid_ext = os.path.splitext(vid_basename)
         
-            target_output_path = os.path.join(batch_output_dir, f"{vid_name_no_ext}_no_watermark{vid_ext}")
+            log_output += f"\n{'='*55}\n📁 [{idx+1}/{len(videos)}] Processing: {vid_basename}\n{'='*55}\n"
+            yield log_output, final_output_paths
+
+            suffix_parts = []
+            if do_watermark: suffix_parts.append("nowm")
+            if do_upscale: suffix_parts.append("upscaled")
+            if do_metadata:
+                if vid_ext.lower() in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
+                    suffix_parts.append("exif")
+                else:
+                    suffix_parts.append("60fps")
+            suffix_str = "_" + "_".join(suffix_parts) if suffix_parts else "_out"
+            target_output_path = os.path.join(batch_output_dir, f"{vid_name_no_ext}{suffix_str}{vid_ext}")
             
             # Register job
             job_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -196,11 +233,12 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
             current_mask_path = uploaded_mask_path
         
             if do_watermark and not current_mask_path:
-                yield f"Extracting mask for {vid_basename}...\n", final_output_paths
+                log_output += f">> Extracting mask for {vid_basename}...\n"
+                yield log_output, final_output_paths
                 unique_mask_name = f"temp_drawn_mask_{vid_name_no_ext}_{gpu_id}.png"
                 try:
                     current_mask_path = extract_mask_from_editor(mask_editor, unique_mask_name)
-                except Exception as e:
+                except Exception:
                     pass
                 
                 # Fallback to AI auto-mask if no manual drawing
@@ -213,17 +251,23 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                     for j in job_registry:
                         if j["id"] == job_id:
                             j["status"] = "❌ Failed (No Mask)"
-                yield f"Error: No mask uploaded and no mask drawn for {vid_basename}.\n", final_output_paths
+                log_output += f"❌ Error: No mask uploaded and no mask drawn for {vid_basename}.\n"
+                yield log_output, final_output_paths
                 continue
                 
             # --- IMAGE PROCESSING ---
             if vid_ext.lower() in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
                 try:
+                    current_img_stage = vid_path
+
+                    # STEP 1: WATERMARK REMOVAL
                     if do_watermark:
-                        yield f"Processing static image {vid_basename} via LaMa AI Inpainting...\n", final_output_paths
+                        log_output += f">> Step 1/3: Removing watermark via LaMa AI Inpainting...\n"
+                        yield log_output, final_output_paths
                         global lama_model
                         if lama_model is None:
-                            yield f"Loading LaMa Model for the first time... (Please wait)\n", final_output_paths
+                            log_output += f">> Loading LaMa model into memory...\n"
+                            yield log_output, final_output_paths
                             from simple_lama_inpainting import SimpleLama
                             lama_model = SimpleLama()
                             
@@ -235,18 +279,89 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                         result_pil = lama_model(img_rgb, mask_img)
                         result = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
-                        cv2.imwrite(target_output_path, result) # This strips metadata natively
-                    else:
-                        yield f"Skipping watermark removal for {vid_basename} (Processing metadata only)...\n", final_output_paths
-                        shutil.copy(vid_path, target_output_path)
                         
+                        temp_nowm_path = os.path.join(batch_output_dir, f"temp_nowm_{vid_name_no_ext}.png")
+                        cv2.imwrite(temp_nowm_path, result)
+                        current_img_stage = temp_nowm_path
+                        log_output += f"✅ Step 1 Complete: Watermark removed successfully.\n"
+                        yield log_output, final_output_paths
+
+                        # CRITICAL: Clean up LaMa from GPU memory so SeedVR2 has 100% VRAM free
+                        del lama_model
+                        lama_model = None
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        log_output += f">> Step 1/3: Skipping watermark removal.\n"
+                        yield log_output, final_output_paths
+
+                    # STEP 2: SEEDVR2 UPSCALING
+                    if do_upscale:
+                        log_output += f"\n--- Step 2/3: SeedVR2 Super-Resolution Image Upscaling ({seedvr2_img_res}p) ---\n"
+                        yield log_output, final_output_paths
+                        with registry_lock:
+                            for j in job_registry:
+                                if j["id"] == job_id:
+                                    j["status"] = "⏳ Upscaling (SeedVR2)..."
+                        
+                        img_upscale_out = os.path.join(batch_output_dir, f"temp_seedvr2_{vid_name_no_ext}.png")
+                        upscale_success = False
+                        upscale_res_path = None
+                        upscale_err_msg = None
+
+                        for log_line, finished, success, res_info in stream_seedvr2_upscale(
+                            input_path=current_img_stage,
+                            output_path=img_upscale_out,
+                            is_video=False,
+                            resolution=int(seedvr2_img_res),
+                            gpu_select=gpu_select,
+                            color_correction=seedvr2_color_corr,
+                            vae_tiled=seedvr2_vae_tiled,
+                            dit_model=DEFAULT_DIT_MODEL
+                        ):
+                            if log_line:
+                                log_output += log_line
+                                yield log_output, final_output_paths
+                            if finished:
+                                upscale_success = success
+                                if success:
+                                    upscale_res_path = res_info
+                                else:
+                                    upscale_err_msg = res_info
+
+                        if upscale_success and upscale_res_path and os.path.exists(upscale_res_path):
+                            current_img_stage = upscale_res_path
+                            log_output += f"\n✅ Step 2 Complete: SeedVR2 Image Upscaling Complete ({seedvr2_img_res}p)!\n"
+                            yield log_output, final_output_paths
+                        else:
+                            err_msg = upscale_err_msg or "Unknown SeedVR2 error"
+                            with registry_lock:
+                                for j in job_registry:
+                                    if j["id"] == job_id:
+                                        j["status"] = f"❌ Failed (SeedVR2 Error)"
+                            log_output += f"\n❌ ERROR: SeedVR2 Image Upscaling failed: {err_msg}\n"
+                            yield log_output, final_output_paths
+                            continue
+                    else:
+                        log_output += f">> Step 2/3: Skipping upscaling.\n"
+                        yield log_output, final_output_paths
+
+                    # STEP 3: FORMAT CONVERSION & METADATA FORGING
+                    log_output += f"\n--- Step 3/3: Finalizing output image and metadata ---\n"
+                    yield log_output, final_output_paths
+
+                    final_img = cv2.imread(current_img_stage)
+                    if final_img is None:
+                        raise RuntimeError(f"Failed to read processed image stage from {current_img_stage}")
+
                     if target_output_path.lower().endswith((".jpg", ".jpeg")):
+                        cv2.imwrite(target_output_path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                         try:
                             import piexif
                         except ImportError:
                             subprocess.run([sys.executable, "-m", "pip", "install", "piexif", "-q"])
                             import piexif
-                        
+
                         if do_metadata:
                             try:
                                 zeroth_ifd = {
@@ -256,28 +371,35 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                                 }
                                 exif_bytes = piexif.dump({"0th": zeroth_ifd, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None})
                                 piexif.insert(exif_bytes, target_output_path)
-                                msg = f"SUCCESS: Image saved to {target_output_path} (Forged iPhone 14 Pro Metadata)\n"
+                                log_output += f"✅ Apple iPhone 14 Pro metadata forged successfully.\n"
                             except Exception as meta_e:
-                                msg = f"SUCCESS: Image saved to {target_output_path} (Metadata Stripped, but forge failed: {meta_e})\n"
+                                log_output += f"Warning: Metadata forge error: {meta_e}\n"
                         else:
-                            # User didn't request metadata removal, so restore original if watermark removed
-                            if do_watermark:
+                            if do_watermark or do_upscale:
                                 try:
                                     original_exif = piexif.load(vid_path)
                                     exif_bytes = piexif.dump(original_exif)
                                     piexif.insert(exif_bytes, target_output_path)
-                                    msg = f"SUCCESS: Image saved to {target_output_path} (Original Metadata Preserved)\n"
+                                    log_output += f"✅ Original metadata preserved.\n"
                                 except Exception:
-                                    msg = f"SUCCESS: Image saved to {target_output_path} (No Original Metadata Found)\n"
-                            else:
-                                msg = f"SUCCESS: Image saved to {target_output_path} (Unchanged)\n"
+                                    pass
                     else:
-                        strip_msg = " (Metadata Stripped)" if do_watermark else "" # cv2 strips png meta implicitly
-                        msg = f"SUCCESS: Image saved to {target_output_path}{strip_msg}\n"
-                        
+                        cv2.imwrite(target_output_path, final_img)
+                        log_output += f"✅ Image saved cleanly.\n"
+
+                    # Clean up temporary stage files
+                    if current_img_stage != vid_path and os.path.exists(current_img_stage):
+                        try: os.remove(current_img_stage)
+                        except Exception: pass
+                    temp_nowm = os.path.join(batch_output_dir, f"temp_nowm_{vid_name_no_ext}.png")
+                    if os.path.exists(temp_nowm):
+                        try: os.remove(temp_nowm)
+                        except Exception: pass
+
                     final_output_paths.append(target_output_path)
-                    yield msg, final_output_paths
-                    
+                    log_output += f"\n🎉 SUCCESS: Saved {vid_basename} to {target_output_path}\n"
+                    yield log_output, final_output_paths
+
                     with registry_lock:
                         for j in job_registry:
                             if j["id"] == job_id:
@@ -288,19 +410,18 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                         for j in job_registry:
                             if j["id"] == job_id:
                                 j["status"] = f"❌ Failed ({str(e)})"
-                    yield f"Error processing image {vid_basename}: {e}\n", final_output_paths
+                    log_output += f"\n❌ Unexpected error processing image {vid_basename}: {e}\n"
+                    yield log_output, final_output_paths
                 
                 # Cleanup for images
                 try:
                     if current_mask_path and os.path.basename(current_mask_path).startswith("temp_drawn_mask_") and os.path.exists(current_mask_path):
                         os.remove(current_mask_path)
-                    # Removed os.remove(vid_path) because Gradio handles temp files
-                except:
+                except Exception:
                     pass
                 continue                  
             # --- VIDEO PROCESSING ---
             best_out = None
-            log_output = ""
             expected_result_dir = os.path.join("results", vid_name_no_ext)
             
             if do_watermark:
@@ -528,9 +649,60 @@ def process_videos(videos, masks, mask_editor, auto_mask_state, max_resolution, 
                     yield log_output, final_output_paths
                     continue
             else:
-                log_output = f"--- Skipping watermark removal for {vid_basename} (Processing metadata only) ---\n"
+                log_output += f">> Skipping watermark removal for {vid_basename}...\n"
                 best_out = vid_path
                 yield log_output, final_output_paths
+
+            if do_upscale and best_out:
+                log_output += f"\n--- Initiating SeedVR2 Video Upscaling (Target: {seedvr2_vid_res}p) ---\n"
+                yield log_output, final_output_paths
+                with registry_lock:
+                    for j in job_registry:
+                        if j["id"] == job_id:
+                            j["status"] = "⏳ Upscaling (SeedVR2)..."
+
+                upscale_vid_out = os.path.join(expected_result_dir, f"{vid_name_no_ext}_upscaled.mp4")
+                upscale_success = False
+                upscale_res_path = None
+                upscale_err_msg = None
+
+                for log_line, finished, success, res_info in stream_seedvr2_upscale(
+                    input_path=best_out,
+                    output_path=upscale_vid_out,
+                    is_video=True,
+                    resolution=int(seedvr2_vid_res),
+                    gpu_select=gpu_select,
+                    chunk_size=int(seedvr2_chunk_size),
+                    temporal_overlap=2,
+                    batch_size=5,
+                    color_correction=seedvr2_color_corr,
+                    vae_tiled=seedvr2_vae_tiled,
+                    tile_size=1024,
+                    dit_model=DEFAULT_DIT_MODEL
+                ):
+                    if log_line:
+                        log_output += log_line
+                        yield log_output, final_output_paths
+                    if finished:
+                        upscale_success = success
+                        if success:
+                            upscale_res_path = res_info
+                        else:
+                            upscale_err_msg = res_info
+
+                if upscale_success and upscale_res_path and os.path.exists(upscale_res_path):
+                    best_out = upscale_res_path
+                    log_output += f"\n>> SeedVR2 Video Upscaling Complete! ({seedvr2_vid_res}p)\n"
+                    yield log_output, final_output_paths
+                else:
+                    err_msg = upscale_err_msg or "Unknown error"
+                    with registry_lock:
+                        for j in job_registry:
+                            if j["id"] == job_id:
+                                j["status"] = f"❌ Failed (SeedVR2 Error)"
+                    log_output += f"\n❌ SeedVR2 Video Upscaling failed: {err_msg}\n"
+                    yield log_output, final_output_paths
+                    continue
 
             output_found = False
             if best_out:
@@ -693,85 +865,103 @@ with gr.Blocks(title="ProPainter Local GUI") as demo:
                 with gr.Column(scale=1):
                     gr.Markdown("### 1. Select Tasks to Perform")
                     task_selection = gr.CheckboxGroup(
-                        choices=["Watermark Removal", "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps"],
-                        value=["Watermark Removal", "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps"],
+                        choices=["Watermark Removal", "SeedVR2 Upscaling", "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps"],
+                        value=["Watermark Removal", "SeedVR2 Upscaling", "Meta Tag Removal / Forge Apple Metadata / RIFE 60fps"],
                         label="Pipeline Tasks"
                     )
                     
                     gr.Markdown("### 2. Upload Media (Video or Image)")
                     video_input = gr.File(file_count="multiple", label="Upload Files (MP4, AVI, MOV, JPG, PNG)", file_types=["video", "image"])
                     
-                    gr.Markdown("### 2. Mask the Watermark")
-                    gr.Markdown("When you upload a video, its first frame will appear below.")
+                    media_preview_gallery = gr.Gallery(
+                        label="Uploaded Media Preview (Click to view / play)",
+                        columns=3,
+                        height=160,
+                        object_fit="contain",
+                        visible=False,
+                        interactive=False,
+                        show_label=True
+                    )
                     
-                    with gr.Tabs():
-                        with gr.TabItem("Auto-Select (Click)"):
-                            gr.Markdown("Click **exactly on the watermark** to automatically outline it using AI (MobileSAM).")
-                            auto_mask_image = gr.Image(label="Click to Auto-Mask", type="numpy", interactive=True)
-                            auto_mask_state = gr.State(None)
-                            clean_frame_state = gr.State(None)
-                            
-                        with gr.TabItem("Manual Draw"):
-                            gr.Markdown("Use the brush tool to paint over the watermark.")
-                            mask_editor = gr.ImageEditor(
-                                label="Draw Mask",
-                                type="numpy",
-                                interactive=True,
-                                brush=gr.Brush(colors=["#FFFFFF"], color_mode="fixed"),
-                                eraser=gr.Eraser()
-                            )
-                    
-                    reset_drawing_btn = gr.Button("Reset Mask Canvas", size="sm")
-                    
-                    # Automatically update the canvases when a video is uploaded
+                    # Update media preview gallery when files are uploaded or cleared
                     video_input.change(
-                        fn=lambda v: (lambda f: (f, f, None, f))(extract_first_frame(v)[0]),
-                        inputs=video_input, 
-                        outputs=[mask_editor, auto_mask_image, auto_mask_state, clean_frame_state]
-                    )
-                    
-                    # Allow user to explicitly clear the drawing
-                    reset_drawing_btn.click(
-                        fn=lambda v: (lambda f: (f, f, None, f))(extract_first_frame(v)[0]),
+                        fn=get_media_previews,
                         inputs=video_input,
-                        outputs=[mask_editor, auto_mask_image, auto_mask_state, clean_frame_state]
+                        outputs=media_preview_gallery
                     )
                     
-                    # Handle click on Auto-Mask image
-                    def handle_auto_mask_click(evt: gr.SelectData, clean_frame, current_mask_state):
-                        if clean_frame is None:
-                            return None, None
-                        from auto_mask import generate_auto_mask
-                        # Run SAM on the clean frame so previous red overlays don't confuse the model
-                        _, new_mask = generate_auto_mask(clean_frame, evt.index[0], evt.index[1])
+                    with gr.Column(visible=True) as mask_section:
+                        gr.Markdown("### 3. Mask the Watermark")
+                        gr.Markdown("When you upload a video, its first frame will appear below.")
                         
-                        # Accumulate multiple watermark clicks
-                        if current_mask_state is not None:
-                            merged_mask = cv2.bitwise_or(current_mask_state, new_mask)
-                        else:
-                            merged_mask = new_mask
+                        with gr.Tabs():
+                            with gr.TabItem("Auto-Select (Click)"):
+                                gr.Markdown("Click **exactly on the watermark** to automatically outline it using AI (MobileSAM).")
+                                auto_mask_image = gr.Image(label="Click to Auto-Mask", type="numpy", interactive=True)
+                                auto_mask_state = gr.State(None)
+                                clean_frame_state = gr.State(None)
+                                
+                            with gr.TabItem("Manual Draw"):
+                                gr.Markdown("Use the brush tool to paint over the watermark.")
+                                mask_editor = gr.ImageEditor(
+                                    label="Draw Mask",
+                                    type="numpy",
+                                    interactive=True,
+                                    brush=gr.Brush(colors=["#FFFFFF"], color_mode="fixed"),
+                                    eraser=gr.Eraser()
+                                )
+                        
+                        reset_drawing_btn = gr.Button("Reset Mask Canvas", size="sm")
+                        
+                        # Automatically update the canvases when a video is uploaded
+                        video_input.change(
+                            fn=lambda v: (lambda f: (f, f, None, f))(extract_first_frame(v)[0]),
+                            inputs=video_input, 
+                            outputs=[mask_editor, auto_mask_image, auto_mask_state, clean_frame_state]
+                        )
+                        
+                        # Allow user to explicitly clear the drawing
+                        reset_drawing_btn.click(
+                            fn=lambda v: (lambda f: (f, f, None, f))(extract_first_frame(v)[0]),
+                            inputs=video_input,
+                            outputs=[mask_editor, auto_mask_image, auto_mask_state, clean_frame_state]
+                        )
+                        
+                        # Handle click on Auto-Mask image
+                        def handle_auto_mask_click(evt: gr.SelectData, clean_frame, current_mask_state):
+                            if clean_frame is None:
+                                return None, None
+                            from auto_mask import generate_auto_mask
+                            # Run SAM on the clean frame so previous red overlays don't confuse the model
+                            _, new_mask = generate_auto_mask(clean_frame, evt.index[0], evt.index[1])
                             
-                        # Generate the combined visual overlay
-                        final_overlay = clean_frame.copy()
-                        red_layer = np.zeros_like(final_overlay)
-                        red_layer[:, :, 0] = 255
-                        alpha = 0.5
-                        mask_bool = merged_mask > 0
-                        final_overlay[mask_bool] = cv2.addWeighted(final_overlay[mask_bool], 1 - alpha, red_layer[mask_bool], alpha, 0)
-                        cv2.drawMarker(final_overlay, (evt.index[0], evt.index[1]), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=15, thickness=2)
+                            # Accumulate multiple watermark clicks
+                            if current_mask_state is not None:
+                                merged_mask = cv2.bitwise_or(current_mask_state, new_mask)
+                            else:
+                                merged_mask = new_mask
+                                
+                            # Generate the combined visual overlay
+                            final_overlay = clean_frame.copy()
+                            red_layer = np.zeros_like(final_overlay)
+                            red_layer[:, :, 0] = 255
+                            alpha = 0.5
+                            mask_bool = merged_mask > 0
+                            final_overlay[mask_bool] = cv2.addWeighted(final_overlay[mask_bool], 1 - alpha, red_layer[mask_bool], alpha, 0)
+                            cv2.drawMarker(final_overlay, (evt.index[0], evt.index[1]), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=15, thickness=2)
+                            
+                            return final_overlay, merged_mask
+            
+                        auto_mask_image.select(
+                            fn=handle_auto_mask_click,
+                            inputs=[clean_frame_state, auto_mask_state],
+                            outputs=[auto_mask_image, auto_mask_state]
+                        )
                         
-                        return final_overlay, merged_mask
-        
-                    auto_mask_image.select(
-                        fn=handle_auto_mask_click,
-                        inputs=[clean_frame_state, auto_mask_state],
-                        outputs=[auto_mask_image, auto_mask_state]
-                    )
-                    
-                    gr.Markdown("### Or Upload External Mask (Optional)")
-                    mask_input = gr.File(file_count="multiple", label="Upload Mask (PNG) or Sequential Mask Frames", file_types=["image"])
+                        gr.Markdown("### Or Upload External Mask (Optional)")
+                        mask_input = gr.File(file_count="multiple", label="Upload Mask (PNG) or Sequential Mask Frames", file_types=["image"])
                         
-                    gr.Markdown("### 3. VRAM Optimization Settings (Auto-Configured for your GPU)")
+                    gr.Markdown("### 4. VRAM Optimization Settings (Auto-Configured for your GPU)")
                     
                     with gr.Row():
                         gpu_select = gr.Dropdown(choices=gpu_choices, value="Auto", label="Target GPU (For Multi-GPU setups)")
@@ -786,6 +976,33 @@ with gr.Blocks(title="ProPainter Local GUI") as demo:
                         raft_iters = gr.Slider(minimum=5, maximum=20, step=1, label="RAFT Iterations (Lower = Much Faster, slightly worse flow)", value=def_raft_iter)
                         subvid_len = gr.Slider(minimum=10, maximum=100, step=5, label="Subvideo Length", value=def_subvid)
                         neighbor_len = gr.Slider(minimum=2, maximum=16, step=2, label="Neighbor Length", value=def_neighbor)
+                    
+                    with gr.Accordion("SeedVR2 Upscaling Settings", open=False):
+                        with gr.Row():
+                            seedvr2_vid_res = gr.Dropdown(
+                                choices=[720, 1080, 1440, 2160],
+                                value=1080,
+                                label="Video Target Resolution (Height / Short Edge)"
+                            )
+                            seedvr2_img_res = gr.Dropdown(
+                                choices=[1080, 1440, 2160, 2880, 3840],
+                                value=2160,
+                                label="Image Target Resolution (Height / Short Edge)"
+                            )
+                        with gr.Row():
+                            seedvr2_chunk_size = gr.Slider(
+                                minimum=15, maximum=120, step=15, value=45,
+                                label="Streaming Chunk Size (Frames)"
+                            )
+                            seedvr2_color_corr = gr.Dropdown(
+                                choices=["lab", "wavelet", "hsv", "none"],
+                                value="lab",
+                                label="Color Correction Mode"
+                            )
+                            seedvr2_vae_tiled = gr.Checkbox(
+                                label="Enable VAE Tiling (Mandatory for >=1080p)",
+                                value=True
+                            )
                     
                     process_btn = gr.Button("Process Video(s)", variant="primary", size="lg")
                     
@@ -845,21 +1062,21 @@ with gr.Blocks(title="ProPainter Local GUI") as demo:
         
     def update_mask_visibility(tasks):
         is_active = "Watermark Removal" in (tasks or [])
-        return [
-            gr.update(interactive=is_active),
-            gr.update(interactive=is_active),
-            gr.update(interactive=is_active)
-        ]
+        return gr.update(visible=is_active)
         
     task_selection.change(
         fn=update_mask_visibility,
         inputs=[task_selection],
-        outputs=[auto_mask_image, mask_editor, mask_input]
+        outputs=[mask_section]
     )
 
     process_btn.click(
         fn=process_videos,
-        inputs=[video_input, mask_input, mask_editor, auto_mask_state, max_resolution, fp16_opt, raft_iters, subvid_len, neighbor_len, gpu_select, task_selection],
+        inputs=[
+            video_input, mask_input, mask_editor, auto_mask_state, max_resolution,
+            fp16_opt, raft_iters, subvid_len, neighbor_len, gpu_select, task_selection,
+            seedvr2_vid_res, seedvr2_img_res, seedvr2_chunk_size, seedvr2_vae_tiled, seedvr2_color_corr
+        ],
         outputs=[console_output, file_outputs]
     )
 

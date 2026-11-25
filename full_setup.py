@@ -51,6 +51,14 @@ def setup():
             urllib.request.urlretrieve(url, path)
             print(f"Finished downloading {name}.")
 
+    # 5. Setup SeedVR2
+    print("Setting up SeedVR2...")
+    try:
+        from seedvr2_runner import setup_seedvr2
+        setup_seedvr2()
+    except Exception as e:
+        print(f"SeedVR2 setup skipped or failed: {e}")
+
     print("Setup complete! Run app.py using your venv to start.")
 
 if __name__ == "__main__":

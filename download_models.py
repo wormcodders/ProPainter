@@ -17,3 +17,11 @@ for name, url in urls.items():
         print(f"Finished downloading {name}.")
     else:
         print(f"{name} already exists.")
+
+# SeedVR2 Models
+try:
+    from seedvr2_runner import ensure_seedvr2_models
+    print("\nChecking SeedVR2 models...")
+    ensure_seedvr2_models()
+except Exception as e:
+    print(f"Note: SeedVR2 model setup skipped or failed: {e}")

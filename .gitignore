@@ -129,3 +129,5 @@ results/
 *debug*
 *old*
 *.sh
+*.safetensors
+seedvr2/
